@@ -1,17 +1,19 @@
+USE [LiloMallTest ]
 GO
-/****** Object:  Trigger [dbo].[trg_OSRN_BlockOnUpdate]    Script Date: 10.10.2025 15:31:33 ******/
+/****** Object:  Trigger [dbo].[trg_OSRN_BlockOnUpdate]    Script Date: 31.10.2025 13:48:22 ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
 GO
-CREATE   TRIGGER [dbo].[trg_OSRN_BlockOnUpdate]
+
+ALTER TRIGGER [dbo].[trg_OSRN_BlockOnUpdate]
 ON [dbo].[OSRN]
 AFTER UPDATE
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- Collect only rows where DistNumber actually changed
+    -- 1) Rows where DistNumber actually changed
     DECLARE @Changed TABLE
     (
         AbsEntry       INT           NOT NULL,
@@ -27,53 +29,76 @@ BEGIN
 
     IF NOT EXISTS (SELECT 1 FROM @Changed) RETURN;
 
-    ----------------------------------------------------------------
-    -- Pick one violating NewDistNumber (if any)
-    -- Violation definition:
-    --   1) The NEW serial already exists on a different OSRN row, AND
-    --   2) That serial’s latest OITL is NOT “cancelled”:
-    --        - Latest.BaseEntry = 0
-    --        - AND it's NOT an Inventory Posting removal
-    --          (DocType = 10000071 AND StockQty < 0)
-    ----------------------------------------------------------------
+    /* --------------------------------------------------------------------
+       Heuristic:
+       - PosCancelTypes: (13,15,19,67)  -> cancellation if StockQty > 0
+       - NegCancelTypes: NOT IN above   -> cancellation if StockQty < 0
+       Block if:
+         A) Latest prior is cancellation AND DocType IN (13,15,19,67)
+         OR
+         B) Latest prior is NOT cancellation, except (DocType=10000071 AND StockQty<0)
+       -------------------------------------------------------------------- */
+
     DECLARE @BadNewDistNumber NVARCHAR(100);
 
     SELECT TOP (1)
         @BadNewDistNumber = c.NewDistNumber
     FROM @Changed c
-    WHERE c.NewDistNumber IS NOT NULL AND c.NewDistNumber <> N''
-      AND EXISTS (   -- NEW serial exists on some other OSRN row
-            SELECT 1
-            FROM dbo.OSRN x
-            WHERE x.DistNumber = c.NewDistNumber
-              AND x.AbsEntry  <> c.AbsEntry
+    WHERE c.NewDistNumber IS NOT NULL
+      AND c.NewDistNumber <> N''
+      AND EXISTS
+      (
+          -- NEW serial already exists on a different OSRN row
+          SELECT 1
+          FROM dbo.OSRN WITH (UPDLOCK, HOLDLOCK)
+          WHERE DistNumber = c.NewDistNumber
+            AND AbsEntry  <> c.AbsEntry
       )
-      AND EXISTS (   -- That serial's latest OITL is NOT cancelled
-            SELECT 1
-            FROM (
-                SELECT TOP (1)
-                       T0.LogEntry,
-                       T0.BaseEntry,
-                       T0.DocType,
-                       T0.StockQty
-                FROM OITL AS T0
-                JOIN ITL1 AS T1
-                  ON T1.LogEntry = T0.LogEntry
-                JOIN OSRN AS T2
-                  ON T2.SysNumber = T1.SysNumber
-                 AND T2.ItemCode  = T1.ItemCode
-                WHERE T2.DistNumber = c.NewDistNumber
-                ORDER BY T0.LogEntry DESC
-            ) AS Latest
-            WHERE ISNULL(Latest.BaseEntry, 0) = 0
-              AND NOT (Latest.DocType = 10000071 AND Latest.StockQty < 0)
+      AND EXISTS
+      (
+          -- That serial's latest prior OITL row violates the rules
+          SELECT 1
+          FROM
+          (
+              SELECT TOP (1)
+                     o.LogEntry,
+                     o.DocType,
+                     o.StockQty
+              FROM dbo.OITL o
+              JOIN dbo.ITL1 i1
+                ON i1.LogEntry = o.LogEntry
+              JOIN dbo.OSRN s2
+                ON s2.SysNumber = i1.SysNumber
+               AND s2.ItemCode  = i1.ItemCode
+              WHERE LTRIM(RTRIM(s2.DistNumber)) = LTRIM(RTRIM(c.NewDistNumber))
+              ORDER BY o.LogEntry DESC
+          ) AS Latest
+          WHERE
+          (
+              -- A) Prior is cancellation AND DocType in (13,15,19,67) -> BLOCK
+              (
+                  (
+                       (Latest.DocType IN (13,15,19,67) AND Latest.StockQty > 0)
+                    OR (Latest.DocType NOT IN (13,15,19,67) AND Latest.StockQty < 0)
+                  )
+                  AND Latest.DocType IN (13,15,19,67)
+              )
+              OR
+              -- B) Prior NOT cancellation -> BLOCK, except explicit exception
+              (
+                  NOT (
+                       (Latest.DocType IN (13,15,19,67) AND Latest.StockQty > 0)
+                    OR (Latest.DocType NOT IN (13,15,19,67) AND Latest.StockQty < 0)
+                  )
+                  AND NOT (Latest.DocType = 10000071 AND Latest.StockQty < 0)
+              )
+          )
       );
 
     IF @BadNewDistNumber IS NOT NULL
     BEGIN
-        DECLARE @msg NVARCHAR(400) =
-            N'აღნიშნული სერიული ნომერი უკვე გამოყენებულია. DistNumber: '
-            + @BadNewDistNumber;
+        DECLARE @msg NVARCHAR(400);
+        SET @msg = N'აღნიშნული სერიული ნომერი უკვე გამოყენებულია. DistNumber: ' + @BadNewDistNumber;
         THROW 50001, @msg, 1;
     END
 END
